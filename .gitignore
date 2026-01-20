@@ -1,0 +1,21 @@
+# Compiled binaries
+terminalSynth
+terminalMIDIrecorder
+tMr-quantize
+synth
+tSynth2
+
+# MIDI output files
+*.mid
+
+# macOS
+.DS_Store
+
+# IDE/Editor
+*.swp
+*.swo
+*~
+
+# Build artifacts
+*.o
+*.dSYM/

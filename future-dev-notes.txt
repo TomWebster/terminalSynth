@@ -1,0 +1,73 @@
+create optimising agent v1
+
+this agent is an expert programmer with specialist knowledge of audio programming
+they code mainly in c, python, and c++, but can also program in assembly and delights in
+optimising code to make it as compact and lightweight as possible. The agent can also 
+optimise for speed, performance, memory, fewest lines of code, or strike a balance.
+
+when invoked the agent will analyse the code, suggest ways that it could optimise and ask
+for user input.
+
+
+
+create a copy of terminalSynth.c and call it terminalMIDIRecord.c
+
+add a 16 track MIDI recorder to terminalMIDIRecord.c
+
+create a master clock which can be started and stopped by pressing the space bar
+
+use the most reliable and accurate method for the clock. it should be precise to record 
+and playback MIDI events at exactly the time that they occurred
+
+the metronome clicks on every beat
+
+create a counter mechanism to count beats and divide them into bars of 4 beats each
+
+once the counter reaches the end of 4 bars (16 beats in total), the counter resets 
+to zero. whenever the clock is stopped, the counter resets to zero.
+
+Each midi channel should have a related MIDI track of the same number which can store
+MIDI data recorded in real-time 
+
+Recording is active when capslock key is engaged. the master clock must be running for 
+recording to start. when the capslock key is disengaged whilst recording, recording 
+finishes and the master clock keeps running. 
+
+When recording starts, incoming MIDI note and velocity data is recorded with a timestamp 
+into the MIDI track associated with the current MIDI channel. 
+
+MIDI channel / track, and Tempo cannot be changed when recording is on.
+
+Whilst recording, when the counter reaches the same position when the recording started 
+after reaching the maximum count, the previously recorded MIDI data is overwritten 
+by new incoming MIDI data.
+
+Add a 'save' function. When the save key is pressed, the program stores the current 
+state of the program and all timestamped MIDI data into a file in the current directory 
+named with the current time in GMT and saved with the suffix .mid
+
+update the key mappings so that:
+
+spacebar = start / stop master clock (toggle)
+capslock = record start / stop (toggle) 
+
+tab = switches metronome on/off (toggle)
+left arrow = octave down on each press
+right arrow = octave up on each press
+up arrow = tempo increment whilst pressed
+down arrow = tempo decrement whilst pressed
+
+'-' = MIDI channel decrement on each press
+'=' = MIDI channel increment on each press
+'[' = program change decrement whilst pressed
+']' = program change increment whilst pressed
+'/' = save current program state and all MIDI data
+
+
+
+
+
+
+
+
+
