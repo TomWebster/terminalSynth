@@ -1,7 +1,13 @@
 /**
- * terminalMIDIrecorder.c - Terminal MIDI Synthesizer with 16-track recorder
+ * terminalMIDI.c - Terminal MIDI Synthesizer with 16-track recorder (optimised)
  *
- * Build: clang -framework AudioToolbox -framework IOKit -framework CoreFoundation terminalMIDIrecorder.c -o terminalMIDIrecorder
+ * Build: clang -framework AudioToolbox -framework IOKit -framework CoreFoundation terminalMIDI.c -o terminalMIDI
+ *
+ * Optimisations:
+ *   - O(1) keycode lookup table (was O(n) linear search)
+ *   - Drift-corrected beat scheduling using mach_absolute_time
+ *   - Tempo-adaptive playback timer interval
+ *   - Metronome synced to beat 1 of master clock
  *
  * Keyboard Layout:
  *   Top:    q w e r t y u i o p  (MIDI notes, octave adjustable)
@@ -55,20 +61,6 @@ typedef struct {
     int eventCount;
     int program;
 } MIDITrack;
-
-// USB HID keycodes - original O(n) linear search version
-// static const struct {
-//     uint16_t keycode;
-//     uint8_t noteOffset;  // Offset from base octave
-// } keymap[] = {
-//     // Bottom row: z x c v b n m (notes 0-6)
-//     {0x1D, 0}, {0x1B, 1}, {0x06, 2}, {0x19, 3}, {0x05, 4}, {0x11, 5}, {0x10, 6},
-//     // Middle row: a s d f g h j k l (notes 7-15)
-//     {0x04, 7}, {0x16, 8}, {0x07, 9}, {0x09, 10}, {0x0A, 11}, {0x0B, 12}, {0x0D, 13}, {0x0E, 14}, {0x0F, 15},
-//     // Top row: q w e r t y u i o p (notes 16-25)
-//     {0x14, 16}, {0x1A, 17}, {0x08, 18}, {0x15, 19}, {0x17, 20}, {0x1C, 21}, {0x18, 22}, {0x0C, 23}, {0x12, 24}, {0x13, 25}
-// };
-// static const int KEYMAP_SIZE = sizeof(keymap) / sizeof(keymap[0]);
 
 // Direct keycode-to-note lookup table (value = noteOffset + 1, 0 = unmapped)
 // O(1) lookup indexed by USB HID keycode, max keycode 0x1D (29)
@@ -406,7 +398,7 @@ static void play_events_in_range(uint32_t startTick, uint32_t endTick) {
     }
 }
 
-// High-resolution playback timer - runs every 1ms for precise event triggering
+// High-resolution playback timer callback
 static void playback_tick(CFRunLoopTimerRef timer, void *info) {
     if (!clockRunning) return;
 
@@ -425,17 +417,6 @@ static void playback_tick(CFRunLoopTimerRef timer, void *info) {
 
     lastPlaybackTick = currentTick;
 }
-
-// Original start_playback_timer - fixed 1ms interval (aggressive)
-// static void start_playback_timer(void) {
-//     if (playbackTimer) {
-//         CFRunLoopTimerInvalidate(playbackTimer);
-//         CFRelease(playbackTimer);
-//     }
-//     playbackTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-//         CFAbsoluteTimeGetCurrent(), 0.001, 0, 0, playback_tick, NULL);
-//     CFRunLoopAddTimer(CFRunLoopGetCurrent(), playbackTimer, kCFRunLoopDefaultMode);
-// }
 
 // Calculate optimal playback timer interval based on tempo
 static double calculate_playback_interval(void) {
@@ -520,22 +501,6 @@ static void beat_tick(CFRunLoopTimerRef timer, void *info) {
 
     schedule_next_beat();
 }
-
-// Original schedule_next_beat - uses CFAbsoluteTimeGetCurrent (can drift with NTP)
-// static void schedule_next_beat(void) {
-//     if (beatTimer) {
-//         CFRunLoopTimerInvalidate(beatTimer);
-//         CFRelease(beatTimer);
-//         beatTimer = NULL;
-//     }
-//     if (clockRunning) {
-//         double interval = 60.0 / metronomeBPM;
-//         beatTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-//             CFAbsoluteTimeGetCurrent() + interval,
-//             0, 0, 0, beat_tick, NULL);
-//         CFRunLoopAddTimer(CFRunLoopGetCurrent(), beatTimer, kCFRunLoopDefaultMode);
-//     }
-// }
 
 // Drift-corrected scheduling using mach_absolute_time
 static void schedule_next_beat(void) {
@@ -967,18 +932,6 @@ static void update_status_display(void) {
     fflush(stdout);
 }
 
-// Key mapping - original O(n) version
-// static int keycode_to_note(uint16_t keycode) {
-//     for (int i = 0; i < KEYMAP_SIZE; i++) {
-//         if (keymap[i].keycode == keycode) {
-//             int note = (currentOctave * 12) + keymap[i].noteOffset;
-//             if (note >= 0 && note < 128) return note;
-//             return -1;
-//         }
-//     }
-//     return -1;
-// }
-
 // Key mapping - O(1) lookup table version
 static int keycode_to_note(uint16_t keycode) {
     if (keycode >= 32) return -1;
@@ -1135,8 +1088,8 @@ int main(void) {
     update_timing_constants();
     disable_echo();
 
-    printf("terminalMIDIrecorder - 16-Track MIDI Recorder\n");
-    printf("══════════════════════════════════════════════\n");
+    printf("terminalMIDI - 16-Track MIDI Recorder (optimised)\n");
+    printf("══════════════════════════════════════════════════\n");
     printf("Notes:     z-m, a-l, q-p (3 rows)\n");
     printf("SPACE      Start/Stop clock\n");
     printf("CAPSLOCK   Record (while clock running)\n");
@@ -1149,7 +1102,7 @@ int main(void) {
     printf("DELETE     Clear current track\n");
     printf("/          Save MIDI file\n");
     printf("ESC        Quit\n");
-    printf("══════════════════════════════════════════════\n");
+    printf("══════════════════════════════════════════════════\n");
     printf("Loop: %d bars x %d beats = %d beats total\n\n", TOTAL_BARS, BEATS_PER_BAR, TOTAL_BEATS);
 
     if (!init_audio()) {
