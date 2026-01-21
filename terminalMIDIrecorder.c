@@ -55,20 +55,31 @@ typedef struct {
     int program;
 } MIDITrack;
 
-// USB HID keycodes
-static const struct {
-    uint16_t keycode;
-    uint8_t noteOffset;  // Offset from base octave
-} keymap[] = {
-    // Bottom row: z x c v b n m (notes 0-6)
-    {0x1D, 0}, {0x1B, 1}, {0x06, 2}, {0x19, 3}, {0x05, 4}, {0x11, 5}, {0x10, 6},
-    // Middle row: a s d f g h j k l (notes 7-15)
-    {0x04, 7}, {0x16, 8}, {0x07, 9}, {0x09, 10}, {0x0A, 11}, {0x0B, 12}, {0x0D, 13}, {0x0E, 14}, {0x0F, 15},
-    // Top row: q w e r t y u i o p (notes 16-25)
-    {0x14, 16}, {0x1A, 17}, {0x08, 18}, {0x15, 19}, {0x17, 20}, {0x1C, 21}, {0x18, 22}, {0x0C, 23}, {0x12, 24}, {0x13, 25}
-};
+// USB HID keycodes - original O(n) linear search version
+// static const struct {
+//     uint16_t keycode;
+//     uint8_t noteOffset;  // Offset from base octave
+// } keymap[] = {
+//     // Bottom row: z x c v b n m (notes 0-6)
+//     {0x1D, 0}, {0x1B, 1}, {0x06, 2}, {0x19, 3}, {0x05, 4}, {0x11, 5}, {0x10, 6},
+//     // Middle row: a s d f g h j k l (notes 7-15)
+//     {0x04, 7}, {0x16, 8}, {0x07, 9}, {0x09, 10}, {0x0A, 11}, {0x0B, 12}, {0x0D, 13}, {0x0E, 14}, {0x0F, 15},
+//     // Top row: q w e r t y u i o p (notes 16-25)
+//     {0x14, 16}, {0x1A, 17}, {0x08, 18}, {0x15, 19}, {0x17, 20}, {0x1C, 21}, {0x18, 22}, {0x0C, 23}, {0x12, 24}, {0x13, 25}
+// };
+// static const int KEYMAP_SIZE = sizeof(keymap) / sizeof(keymap[0]);
 
-static const int KEYMAP_SIZE = sizeof(keymap) / sizeof(keymap[0]);
+// Direct keycode-to-note lookup table (value = noteOffset + 1, 0 = unmapped)
+// O(1) lookup indexed by USB HID keycode, max keycode 0x1D (29)
+static const uint8_t keymapLUT[32] = {
+    [0x04] = 8,  [0x05] = 5,  [0x06] = 3,  [0x07] = 10,  // a, b, c, d
+    [0x08] = 19, [0x09] = 11, [0x0A] = 12, [0x0B] = 13,  // e, f, g, h
+    [0x0C] = 24, [0x0D] = 14, [0x0E] = 15, [0x0F] = 16,  // i, j, k, l
+    [0x10] = 7,  [0x11] = 6,  [0x12] = 25, [0x13] = 26,  // m, n, o, p
+    [0x14] = 17, [0x15] = 20, [0x16] = 9,  [0x17] = 21,  // q, r, s, t
+    [0x18] = 23, [0x19] = 4,  [0x1A] = 18, [0x1B] = 2,   // u, v, w, x
+    [0x1C] = 22, [0x1D] = 1,                              // y, z
+};
 
 // HID keycodes
 static const uint16_t ESC_KEYCODE = 0x29;
@@ -144,6 +155,8 @@ static mach_timebase_info_data_t timebaseInfo;
 static uint64_t clockStartTime = 0;     // When clock started (mach ticks)
 static uint64_t loopStartTime = 0;      // When current loop started
 static uint64_t nanosPerTick = 0;       // Nanoseconds per MIDI tick
+static uint64_t nanosPerBeat = 0;       // Nanoseconds per beat (for timer scheduling)
+static uint64_t nextBeatMachTime = 0;   // Next beat in mach ticks (drift-corrected)
 static uint32_t totalLoopTicks = TICKS_PER_BEAT * TOTAL_BEATS;
 
 // Global state - Timers
@@ -201,6 +214,7 @@ static void update_timing_constants(void) {
     // 1 minute = metronomeBPM beats
     // So: nanos per tick = (60 * 1e9) / (BPM * TICKS_PER_BEAT)
     nanosPerTick = (uint64_t)(60.0 * 1e9 / (metronomeBPM * TICKS_PER_BEAT));
+    nanosPerBeat = (uint64_t)(60.0 * 1e9 / metronomeBPM);
 }
 
 static uint32_t get_current_tick(void) {
@@ -383,16 +397,39 @@ static void playback_tick(CFRunLoopTimerRef timer, void *info) {
     lastPlaybackTick = currentTick;
 }
 
+// Original start_playback_timer - fixed 1ms interval (aggressive)
+// static void start_playback_timer(void) {
+//     if (playbackTimer) {
+//         CFRunLoopTimerInvalidate(playbackTimer);
+//         CFRelease(playbackTimer);
+//     }
+//     playbackTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+//         CFAbsoluteTimeGetCurrent(), 0.001, 0, 0, playback_tick, NULL);
+//     CFRunLoopAddTimer(CFRunLoopGetCurrent(), playbackTimer, kCFRunLoopDefaultMode);
+// }
+
+// Calculate optimal playback timer interval based on tempo
+static double calculate_playback_interval(void) {
+    // Seconds per tick = 60 / (BPM * TICKS_PER_BEAT)
+    // Use half the tick duration to ensure we check twice per tick
+    // Clamp between 1ms (high tempo) and 5ms (low tempo) for efficiency
+    double secsPerTick = 60.0 / (metronomeBPM * TICKS_PER_BEAT);
+    double interval = secsPerTick * 0.5;
+    if (interval < 0.001) interval = 0.001;  // Min 1ms
+    if (interval > 0.005) interval = 0.005;  // Max 5ms
+    return interval;
+}
+
 static void start_playback_timer(void) {
     if (playbackTimer) {
         CFRunLoopTimerInvalidate(playbackTimer);
         CFRelease(playbackTimer);
     }
 
-    // Run every 1ms for high resolution playback
+    double interval = calculate_playback_interval();
     playbackTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
         CFAbsoluteTimeGetCurrent(),
-        0.001,  // 1ms interval
+        interval,
         0, 0,
         playback_tick,
         NULL);
@@ -413,9 +450,16 @@ static void beat_tick(CFRunLoopTimerRef timer, void *info) {
 
     int beatInBar = currentBeat % BEATS_PER_BAR;
 
-    // Metronome
+    // Reset loop timing on beat 1 BEFORE metronome plays
+    // This ensures the downbeat is at tick 0 of the master clock
+    if (currentBeat == 0) {
+        loopStartTime = mach_absolute_time();
+        lastPlaybackTick = 0;
+        playbackWrapped = false;
+    }
+
+    // Metronome - now properly aligned with beat 1
     if (metronomeEnabled && synthUnit) {
-        // Accent on beat 1 of each bar
         uint8_t velocity = (beatInBar == 0) ? 120 : 80;
         uint8_t note = (beatInBar == 0) ? 76 : 77;  // Hi/Lo wood block
         MusicDeviceMIDIEvent(synthUnit, 0x99, note, velocity, 0);
@@ -434,20 +478,32 @@ static void beat_tick(CFRunLoopTimerRef timer, void *info) {
         }
     }
 
+    // Update display before incrementing so it shows current beat
+    update_status_display();
+
     // Advance beat counter
     currentBeat = (currentBeat + 1) % TOTAL_BEATS;
 
-    // Check for loop reset
-    if (currentBeat == 0) {
-        loopStartTime = mach_absolute_time();
-        lastPlaybackTick = 0;
-        playbackWrapped = false;
-    }
-
-    update_status_display();
     schedule_next_beat();
 }
 
+// Original schedule_next_beat - uses CFAbsoluteTimeGetCurrent (can drift with NTP)
+// static void schedule_next_beat(void) {
+//     if (beatTimer) {
+//         CFRunLoopTimerInvalidate(beatTimer);
+//         CFRelease(beatTimer);
+//         beatTimer = NULL;
+//     }
+//     if (clockRunning) {
+//         double interval = 60.0 / metronomeBPM;
+//         beatTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
+//             CFAbsoluteTimeGetCurrent() + interval,
+//             0, 0, 0, beat_tick, NULL);
+//         CFRunLoopAddTimer(CFRunLoopGetCurrent(), beatTimer, kCFRunLoopDefaultMode);
+//     }
+// }
+
+// Drift-corrected scheduling using mach_absolute_time
 static void schedule_next_beat(void) {
     if (beatTimer) {
         CFRunLoopTimerInvalidate(beatTimer);
@@ -456,9 +512,16 @@ static void schedule_next_beat(void) {
     }
 
     if (clockRunning) {
-        double interval = 60.0 / metronomeBPM;
+        // Calculate next beat time in mach ticks (drift-corrected)
+        nextBeatMachTime += nanos_to_mach(nanosPerBeat);
+
+        // Convert mach time delta to seconds for CFRunLoopTimer
+        uint64_t now = mach_absolute_time();
+        int64_t deltaMach = (int64_t)(nextBeatMachTime - now);
+        double delaySecs = (deltaMach > 0) ? mach_to_nanos(deltaMach) / 1e9 : 0.0;
+
         beatTimer = CFRunLoopTimerCreate(kCFAllocatorDefault,
-            CFAbsoluteTimeGetCurrent() + interval,
+            CFAbsoluteTimeGetCurrent() + delaySecs,
             0,  // Non-repeating
             0, 0,
             beat_tick,
@@ -475,6 +538,7 @@ static void start_clock(void) {
     uint64_t now = mach_absolute_time();
     clockStartTime = now;
     loopStartTime = now;
+    nextBeatMachTime = now;  // Initialize for drift-corrected scheduling
     lastPlaybackTick = 0;
     playbackWrapped = false;
     update_timing_constants();
@@ -554,6 +618,10 @@ static void tempo_change(int bpm) {
     if (bpm > 300) bpm = 300;
     metronomeBPM = bpm;
     update_timing_constants();
+    // Restart playback timer with new tempo-optimized interval
+    if (clockRunning && playbackTimer) {
+        start_playback_timer();
+    }
     update_status_display();
 }
 
@@ -834,16 +902,25 @@ static void update_status_display(void) {
     fflush(stdout);
 }
 
-// Key mapping
+// Key mapping - original O(n) version
+// static int keycode_to_note(uint16_t keycode) {
+//     for (int i = 0; i < KEYMAP_SIZE; i++) {
+//         if (keymap[i].keycode == keycode) {
+//             int note = (currentOctave * 12) + keymap[i].noteOffset;
+//             if (note >= 0 && note < 128) return note;
+//             return -1;
+//         }
+//     }
+//     return -1;
+// }
+
+// Key mapping - O(1) lookup table version
 static int keycode_to_note(uint16_t keycode) {
-    for (int i = 0; i < KEYMAP_SIZE; i++) {
-        if (keymap[i].keycode == keycode) {
-            int note = (currentOctave * 12) + keymap[i].noteOffset;
-            if (note >= 0 && note < 128) return note;
-            return -1;
-        }
-    }
-    return -1;
+    if (keycode >= 32) return -1;
+    uint8_t offset = keymapLUT[keycode];
+    if (offset == 0) return -1;
+    int note = (currentOctave * 12) + (offset - 1);
+    return (note < 128) ? note : -1;
 }
 
 // HID callback
