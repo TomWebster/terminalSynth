@@ -1,4 +1,5 @@
-/**
+ /**
+ * tmw software programmed with claude-code
  * terminalMIDI.c - Terminal MIDI Synthesizer with 16-track recorder (optimised)
  *
  * Build: clang -framework AudioToolbox -framework IOKit -framework CoreFoundation terminalMIDI.c -o terminalMIDI
@@ -1086,7 +1087,7 @@ int main(void) {
 
     init_timing();
     update_timing_constants();
-    disable_echo();
+    disable_echo();2
 
     printf("terminalMIDI - 16-Track MIDI Recorder (optimised)\n");
     printf("══════════════════════════════════════════════════\n");
