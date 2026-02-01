@@ -12,6 +12,9 @@ terminalSynth is a macOS terminal-based MIDI synthesizer that converts keyboard 
 # Build terminalSynth
 clang -framework AudioToolbox -framework IOKit -framework CoreFoundation terminalSynth.c -o terminalSynth
 
+# Build terminalMIDI (with external MIDI output support)
+clang -framework AudioToolbox -framework CoreMIDI -framework ApplicationServices -framework CoreFoundation terminalMIDI.c -o terminalMIDI
+
 # Build synthSnag
 clang -framework AudioToolbox -framework IOKit -framework CoreFoundation synthSnag.c -o synthSnag
 ```
@@ -20,6 +23,7 @@ clang -framework AudioToolbox -framework IOKit -framework CoreFoundation synthSn
 
 ```bash
 ./terminalSynth   # Requires Input Monitoring permission in System Settings
+./terminalMIDI    # Requires Accessibility permission in System Settings (Privacy & Security > Accessibility)
 ./synthSnag       # Requires Input Monitoring permission in System Settings
 ```
 

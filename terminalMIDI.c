@@ -2,7 +2,7 @@
  * tmw software programmed with claude-code
  * terminalMIDI.c - Terminal MIDI Synthesizer with 16-track recorder (optimised)
  *
- * Build: clang -framework AudioToolbox -framework IOKit -framework CoreFoundation terminalMIDI.c -o terminalMIDI
+ * Build: clang -framework AudioToolbox -framework CoreMIDI -framework ApplicationServices -framework CoreFoundation terminalMIDI.c -o terminalMIDI
  *
  * Optimisations:
  *   - O(1) keycode lookup table (was O(n) linear search)
@@ -23,12 +23,15 @@
  *   UP/DOWN   = Tempo up/down (hold)
  *   - =       = MIDI channel down/up
  *   [ ]       = Program change down/up (hold)
+ *   0-9       = Select MIDI output (0=internal, 1-9=external)
  *   /         = Save MIDI file
+ *   \         = Panic (all notes off on all channels)
  *   ESC       = Quit
  */
 
 #include <AudioToolbox/AudioToolbox.h>
-#include <IOKit/hid/IOHIDManager.h>
+#include <CoreMIDI/CoreMIDI.h>
+#include <ApplicationServices/ApplicationServices.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach_time.h>
 #include <stdio.h>
@@ -64,33 +67,66 @@ typedef struct {
 } MIDITrack;
 
 // Direct keycode-to-note lookup table (value = noteOffset + 1, 0 = unmapped)
-// O(1) lookup indexed by USB HID keycode, max keycode 0x1D (29)
-static const uint8_t keymapLUT[32] = {
-    [0x04] = 8,  [0x05] = 5,  [0x06] = 3,  [0x07] = 10,  // a, b, c, d
-    [0x08] = 19, [0x09] = 11, [0x0A] = 12, [0x0B] = 13,  // e, f, g, h
-    [0x0C] = 24, [0x0D] = 14, [0x0E] = 15, [0x0F] = 16,  // i, j, k, l
-    [0x10] = 7,  [0x11] = 6,  [0x12] = 25, [0x13] = 26,  // m, n, o, p
-    [0x14] = 17, [0x15] = 20, [0x16] = 9,  [0x17] = 21,  // q, r, s, t
-    [0x18] = 23, [0x19] = 4,  [0x1A] = 18, [0x1B] = 2,   // u, v, w, x
-    [0x1C] = 22, [0x1D] = 1,                              // y, z
+// O(1) lookup indexed by macOS virtual keycode
+// Note keys: z x c v b n m (bottom), a s d f g h j k l (middle), q w e r t y u i o p (top)
+static const uint8_t keymapLUT[128] = {
+    [0x00] = 8,   // a
+    [0x01] = 9,   // s
+    [0x02] = 10,  // d
+    [0x03] = 11,  // f
+    [0x04] = 13,  // h
+    [0x05] = 12,  // g
+    [0x06] = 1,   // z
+    [0x07] = 2,   // x
+    [0x08] = 3,   // c
+    [0x09] = 4,   // v
+    [0x0B] = 5,   // b
+    [0x0C] = 17,  // q
+    [0x0D] = 18,  // w
+    [0x0E] = 19,  // e
+    [0x0F] = 20,  // r
+    [0x10] = 22,  // y
+    [0x11] = 21,  // t
+    [0x1F] = 25,  // o
+    [0x20] = 23,  // u
+    [0x22] = 24,  // i
+    [0x23] = 26,  // p
+    [0x25] = 16,  // l
+    [0x26] = 14,  // j
+    [0x28] = 15,  // k
+    [0x2D] = 6,   // n
+    [0x2E] = 7,   // m
 };
 
-// HID keycodes
-static const uint16_t ESC_KEYCODE = 0x29;
-static const uint16_t TAB_KEYCODE = 0x2B;
+// macOS virtual keycodes - Number keys (0-9)
+static const uint16_t KEY_1_KEYCODE = 0x12;
+static const uint16_t KEY_2_KEYCODE = 0x13;
+static const uint16_t KEY_3_KEYCODE = 0x14;
+static const uint16_t KEY_4_KEYCODE = 0x15;
+static const uint16_t KEY_5_KEYCODE = 0x17;
+static const uint16_t KEY_6_KEYCODE = 0x16;
+static const uint16_t KEY_7_KEYCODE = 0x1A;
+static const uint16_t KEY_8_KEYCODE = 0x1C;
+static const uint16_t KEY_9_KEYCODE = 0x19;
+static const uint16_t KEY_0_KEYCODE = 0x1D;
+
+// macOS virtual keycodes
+static const uint16_t ESC_KEYCODE = 0x35;
+static const uint16_t TAB_KEYCODE = 0x30;
 static const uint16_t CAPSLOCK_KEYCODE = 0x39;
-static const uint16_t SPACE_KEYCODE = 0x2C;
-static const uint16_t MINUS_KEYCODE = 0x2D;
-static const uint16_t EQUALS_KEYCODE = 0x2E;
-static const uint16_t LBRACKET_KEYCODE = 0x2F;
-static const uint16_t RBRACKET_KEYCODE = 0x30;
-static const uint16_t SLASH_KEYCODE = 0x38;
-static const uint16_t DELETE_KEYCODE = 0x2A;      // Backspace/Delete
-static const uint16_t BACKTICK_KEYCODE = 0x35;    // ` key for quantize toggle
-static const uint16_t RIGHT_ARROW_KEYCODE = 0x4F;
-static const uint16_t LEFT_ARROW_KEYCODE = 0x50;
-static const uint16_t DOWN_ARROW_KEYCODE = 0x51;
-static const uint16_t UP_ARROW_KEYCODE = 0x52;
+static const uint16_t SPACE_KEYCODE = 0x31;
+static const uint16_t MINUS_KEYCODE = 0x1B;
+static const uint16_t EQUALS_KEYCODE = 0x18;
+static const uint16_t LBRACKET_KEYCODE = 0x21;
+static const uint16_t RBRACKET_KEYCODE = 0x1E;
+static const uint16_t SLASH_KEYCODE = 0x2C;
+static const uint16_t DELETE_KEYCODE = 0x33;      // Backspace/Delete
+static const uint16_t BACKTICK_KEYCODE = 0x32;    // ` key for quantize toggle
+static const uint16_t BACKSLASH_KEYCODE = 0x2A;   // \ key for panic (all notes off)
+static const uint16_t RIGHT_ARROW_KEYCODE = 0x7C;
+static const uint16_t LEFT_ARROW_KEYCODE = 0x7B;
+static const uint16_t DOWN_ARROW_KEYCODE = 0x7D;
+static const uint16_t UP_ARROW_KEYCODE = 0x7E;
 
 // General MIDI program names
 static const char* gmNames[] = {
@@ -130,11 +166,23 @@ static AUNode synthNode = 0;
 static AudioUnit synthUnit = NULL;
 static struct termios origTermios;
 
+// Global state - MIDI Output
+#define MAX_MIDI_DESTINATIONS 10
+static MIDIClientRef midiClient = 0;
+static MIDIPortRef midiOutPort = 0;
+static MIDIEndpointRef midiDestinations[MAX_MIDI_DESTINATIONS];
+static char midiDestNames[MAX_MIDI_DESTINATIONS][64];
+static int midiDestCount = 0;        // Number of external destinations (excludes internal synth)
+static int selectedOutput = 0;       // 0 = internal synth, 1-9 = external MIDI destinations
+
 // Global state - MIDI
 static MIDITrack tracks[MIDI_TRACKS];
 static int currentChannel = 0;
 static int currentOctave = 3;  // Base octave (C3 = MIDI 36)
 static int8_t heldNoteChannel[128];
+
+// Global state - Key tracking (to ignore key repeat)
+static bool keyIsHeld[128] = {false};
 
 // Global state - Transport
 static bool clockRunning = false;
@@ -178,6 +226,7 @@ static void start_playback_timer(void);
 static void stop_playback_timer(void);
 static void start_recording_on_beat(void);
 static void stop_recording(void);
+static void select_midi_output(int index);
 
 // Terminal handling
 static void restore_terminal(void) {
@@ -262,16 +311,94 @@ static bool init_audio(void) {
     return true;
 }
 
-// MIDI functions
+// MIDI Output initialization
+static bool init_midi_output(void) {
+    OSStatus status = MIDIClientCreate(CFSTR("terminalMIDI"), NULL, NULL, &midiClient);
+    if (status != noErr) return false;
+
+    status = MIDIOutputPortCreate(midiClient, CFSTR("Output"), &midiOutPort);
+    if (status != noErr) return false;
+
+    // Enumerate MIDI destinations
+    ItemCount destCount = MIDIGetNumberOfDestinations();
+    midiDestCount = 0;
+
+    for (ItemCount i = 0; i < destCount && midiDestCount < MAX_MIDI_DESTINATIONS; i++) {
+        MIDIEndpointRef dest = MIDIGetDestination(i);
+        if (dest) {
+            midiDestinations[midiDestCount] = dest;
+
+            // Get destination name
+            CFStringRef name = NULL;
+            MIDIObjectGetStringProperty(dest, kMIDIPropertyName, &name);
+            if (name) {
+                CFStringGetCString(name, midiDestNames[midiDestCount], 64, kCFStringEncodingUTF8);
+                CFRelease(name);
+            } else {
+                snprintf(midiDestNames[midiDestCount], 64, "MIDI Output %d", midiDestCount + 1);
+            }
+            midiDestCount++;
+        }
+    }
+
+    return true;
+}
+
+// Select MIDI output destination (0 = internal synth, 1-9 = external)
+static void select_midi_output(int index) {
+    if (index == 0) {
+        selectedOutput = 0;  // Internal synth
+    } else if (index > 0 && index <= midiDestCount) {
+        selectedOutput = index;  // External MIDI destination
+    } else {
+        return;  // Invalid selection, ignore
+    }
+    update_status_display();
+}
+
+// Send MIDI to external destination
+static void send_midi_to_output(uint8_t status, uint8_t data1, uint8_t data2) {
+    if (selectedOutput == 0 || selectedOutput > midiDestCount) return;
+
+    MIDIEndpointRef dest = midiDestinations[selectedOutput - 1];
+    Byte buffer[64];
+    MIDIPacketList *packetList = (MIDIPacketList *)buffer;
+    MIDIPacket *packet = MIDIPacketListInit(packetList);
+
+    Byte midiData[3] = {status, data1, data2};
+    packet = MIDIPacketListAdd(packetList, sizeof(buffer), packet, 0, 3, midiData);
+
+    if (packet) {
+        MIDISend(midiOutPort, dest, packetList);
+    }
+}
+
+// MIDI functions - route to internal synth OR external MIDI based on selection
 static void note_on_internal(int channel, uint8_t note, uint8_t velocity) {
-    if (synthUnit && note < 128) {
-        MusicDeviceMIDIEvent(synthUnit, 0x90 | channel, note, velocity, 0);
+    if (note >= 128) return;
+
+    if (selectedOutput == 0) {
+        // Internal synth
+        if (synthUnit) {
+            MusicDeviceMIDIEvent(synthUnit, 0x90 | channel, note, velocity, 0);
+        }
+    } else {
+        // External MIDI
+        send_midi_to_output(0x90 | channel, note, velocity);
     }
 }
 
 static void note_off_internal(int channel, uint8_t note) {
-    if (synthUnit && note < 128) {
-        MusicDeviceMIDIEvent(synthUnit, 0x80 | channel, note, 0, 0);
+    if (note >= 128) return;
+
+    if (selectedOutput == 0) {
+        // Internal synth
+        if (synthUnit) {
+            MusicDeviceMIDIEvent(synthUnit, 0x80 | channel, note, 0, 0);
+        }
+    } else {
+        // External MIDI - use note-on with velocity 0 for better compatibility
+        send_midi_to_output(0x90 | channel, note, 0);
     }
 }
 
@@ -327,21 +454,38 @@ static void note_off(uint8_t note) {
 }
 
 static void all_notes_off(void) {
-    if (synthUnit) {
-        for (int i = 0; i < 128; i++) {
-            if (heldNoteChannel[i] >= 0) {
-                note_off_internal(heldNoteChannel[i], i);
-                heldNoteChannel[i] = -1;
-            }
+    for (int i = 0; i < 128; i++) {
+        if (heldNoteChannel[i] >= 0) {
+            note_off_internal(heldNoteChannel[i], i);
+            heldNoteChannel[i] = -1;
         }
     }
+}
+
+// Panic - send All Notes Off (CC 123) on all 16 MIDI channels
+static void midi_panic(void) {
+    for (int ch = 0; ch < 16; ch++) {
+        if (selectedOutput == 0) {
+            if (synthUnit) {
+                MusicDeviceMIDIEvent(synthUnit, 0xB0 | ch, 123, 0, 0);
+            }
+        } else {
+            send_midi_to_output(0xB0 | ch, 123, 0);
+        }
+    }
+    memset(heldNoteChannel, -1, sizeof(heldNoteChannel));
+    update_status_display();
 }
 
 static void program_change(int program) {
     if (recording) return;  // Can't change during recording
     tracks[currentChannel].program = program;
-    if (synthUnit) {
-        MusicDeviceMIDIEvent(synthUnit, 0xC0 | currentChannel, program, 0, 0);
+    if (selectedOutput == 0) {
+        if (synthUnit) {
+            MusicDeviceMIDIEvent(synthUnit, 0xC0 | currentChannel, program, 0, 0);
+        }
+    } else {
+        send_midi_to_output(0xC0 | currentChannel, program, 0);
     }
     update_status_display();
 }
@@ -349,9 +493,14 @@ static void program_change(int program) {
 static void channel_change(int channel) {
     if (recording) return;  // Can't change during recording
     // Send note-off for all 128 notes on the channel we're leaving
-    if (synthUnit) {
-        for (int i = 0; i < 128; i++) {
-            MusicDeviceMIDIEvent(synthUnit, 0x80 | currentChannel, i, 0, 0);
+    for (int i = 0; i < 128; i++) {
+        if (selectedOutput == 0) {
+            if (synthUnit) {
+                MusicDeviceMIDIEvent(synthUnit, 0x80 | currentChannel, i, 0, 0);
+            }
+        } else {
+            // Use note-on with velocity 0 for better compatibility
+            send_midi_to_output(0x90 | currentChannel, i, 0);
         }
     }
     // Clear held note tracking for notes on this channel
@@ -362,8 +511,12 @@ static void channel_change(int channel) {
     }
     currentChannel = channel;
     // Apply program for this channel
-    if (synthUnit) {
-        MusicDeviceMIDIEvent(synthUnit, 0xC0 | currentChannel, tracks[currentChannel].program, 0, 0);
+    if (selectedOutput == 0) {
+        if (synthUnit) {
+            MusicDeviceMIDIEvent(synthUnit, 0xC0 | currentChannel, tracks[currentChannel].program, 0, 0);
+        }
+    } else {
+        send_midi_to_output(0xC0 | currentChannel, tracks[currentChannel].program, 0);
     }
     update_status_display();
 }
@@ -470,7 +623,8 @@ static void beat_tick(CFRunLoopTimerRef timer, void *info) {
     }
 
     // Metronome - now properly aligned with beat 1
-    if (metronomeEnabled && synthUnit) {
+    // Only play on internal synth (channel 9 = drums)
+    if (metronomeEnabled && selectedOutput == 0 && synthUnit) {
         uint8_t velocity = (beatInBar == 0) ? 120 : 80;
         uint8_t note = (beatInBar == 0) ? 76 : 77;  // Hi/Lo wood block
         MusicDeviceMIDIEvent(synthUnit, 0x99, note, velocity, 0);
@@ -558,9 +712,13 @@ static void stop_clock(void) {
     currentBeat = 0;
 
     // Send All Notes Off (CC 123) on all 16 MIDI channels
-    if (synthUnit) {
-        for (int ch = 0; ch < 16; ch++) {
-            MusicDeviceMIDIEvent(synthUnit, 0xB0 | ch, 123, 0, 0);
+    for (int ch = 0; ch < 16; ch++) {
+        if (selectedOutput == 0) {
+            if (synthUnit) {
+                MusicDeviceMIDIEvent(synthUnit, 0xB0 | ch, 123, 0, 0);
+            }
+        } else {
+            send_midi_to_output(0xB0 | ch, 123, 0);
         }
     }
     memset(heldNoteChannel, -1, sizeof(heldNoteChannel));
@@ -928,155 +1086,256 @@ static void update_status_display(void) {
     printf("P%03d:%.19s ", tracks[currentChannel].program, progName);
 
     // Event count for current track
-    printf("[%d]", tracks[currentChannel].eventCount);
+    printf("[%d] ", tracks[currentChannel].eventCount);
+
+    // MIDI Output
+    if (selectedOutput == 0) {
+        printf("Out:Internal");
+    } else if (selectedOutput <= midiDestCount) {
+        printf("Out:%d:%.16s", selectedOutput, midiDestNames[selectedOutput - 1]);
+    }
 
     fflush(stdout);
 }
 
 // Key mapping - O(1) lookup table version
 static int keycode_to_note(uint16_t keycode) {
-    if (keycode >= 32) return -1;
+    if (keycode >= 128) return -1;
     uint8_t offset = keymapLUT[keycode];
     if (offset == 0) return -1;
     int note = (currentOctave * 12) + (offset - 1);
     return (note < 128) ? note : -1;
 }
 
-// HID callback
-static void hid_callback(void *context, IOReturn result, void *sender, IOHIDValueRef value) {
-    IOHIDElementRef element = IOHIDValueGetElement(value);
-    uint32_t usagePage = IOHIDElementGetUsagePage(element);
-    uint32_t usage = IOHIDElementGetUsage(element);
-    long pressed = IOHIDValueGetIntegerValue(value);
-
-    if (usagePage != kHIDPage_KeyboardOrKeypad) return;
-
-    // ESC - Quit
-    if (usage == ESC_KEYCODE && pressed) {
-        printf("\n");
-        CFRunLoopStop(CFRunLoopGetCurrent());
-        return;
-    }
-
-    // SPACE - Toggle clock
-    if (usage == SPACE_KEYCODE && pressed) {
-        toggle_clock();
-        return;
-    }
-
-    // CAPSLOCK - Recording synced to Caps Lock state
-    if (usage == CAPSLOCK_KEYCODE && pressed) {
-        capsLockOn = !capsLockOn;  // Toggle tracks actual Caps Lock state
-        sync_recording_to_capslock();
-        return;
-    }
-
-    // TAB - Toggle metronome
-    if (usage == TAB_KEYCODE && pressed) {
-        toggle_metronome();
-        return;
-    }
-
-    // Arrow keys
-    if (usage == LEFT_ARROW_KEYCODE && pressed) {
-        octave_down();
-        return;
-    }
-    if (usage == RIGHT_ARROW_KEYCODE && pressed) {
-        octave_up();
-        return;
-    }
-    if (usage == UP_ARROW_KEYCODE) {
-        if (pressed) start_tempo_change_timer(1);
-        else stop_tempo_change_timer();
-        return;
-    }
-    if (usage == DOWN_ARROW_KEYCODE) {
-        if (pressed) start_tempo_change_timer(-1);
-        else stop_tempo_change_timer();
-        return;
-    }
-
-    // MINUS - Channel down
-    if (usage == MINUS_KEYCODE && pressed) {
-        channel_change((currentChannel - 1 + 16) % 16);
-        return;
-    }
-
-    // EQUALS - Channel up
-    if (usage == EQUALS_KEYCODE && pressed) {
-        channel_change((currentChannel + 1) % 16);
-        return;
-    }
-
-    // Brackets - Program change
-    if (usage == LBRACKET_KEYCODE) {
-        if (pressed) start_program_change_timer(-1);
-        else stop_program_change_timer();
-        return;
-    }
-    if (usage == RBRACKET_KEYCODE) {
-        if (pressed) start_program_change_timer(1);
-        else stop_program_change_timer();
-        return;
-    }
-
-    // SLASH - Save
-    if (usage == SLASH_KEYCODE && pressed) {
-        save_midi_file();
-        return;
-    }
-
-    // DELETE - Clear current track
-    if (usage == DELETE_KEYCODE && pressed) {
-        clear_current_track();
-        return;
-    }
-
-    // BACKTICK - Toggle quantize
-    if (usage == BACKTICK_KEYCODE && pressed) {
-        toggle_quantize();
-        return;
-    }
-
+// Check if a keycode should be consumed (not passed to other apps)
+static bool should_consume_key(CGKeyCode keycode) {
     // Note keys
-    int note = keycode_to_note(usage);
-    if (note >= 0) {
-        if (pressed) note_on(note, 100);
-        else note_off(note);
-    }
+    if (keycode < 128 && keymapLUT[keycode] != 0) return true;
+
+    // Control keys
+    if (keycode == ESC_KEYCODE) return true;
+    if (keycode == SPACE_KEYCODE) return true;
+    if (keycode == CAPSLOCK_KEYCODE) return true;
+    if (keycode == TAB_KEYCODE) return true;
+    if (keycode == LEFT_ARROW_KEYCODE) return true;
+    if (keycode == RIGHT_ARROW_KEYCODE) return true;
+    if (keycode == UP_ARROW_KEYCODE) return true;
+    if (keycode == DOWN_ARROW_KEYCODE) return true;
+    if (keycode == MINUS_KEYCODE) return true;
+    if (keycode == EQUALS_KEYCODE) return true;
+    if (keycode == LBRACKET_KEYCODE) return true;
+    if (keycode == RBRACKET_KEYCODE) return true;
+    if (keycode == SLASH_KEYCODE) return true;
+    if (keycode == DELETE_KEYCODE) return true;
+    if (keycode == BACKTICK_KEYCODE) return true;
+    if (keycode == BACKSLASH_KEYCODE) return true;
+
+    // Number keys
+    if (keycode == KEY_0_KEYCODE) return true;
+    if (keycode == KEY_1_KEYCODE) return true;
+    if (keycode == KEY_2_KEYCODE) return true;
+    if (keycode == KEY_3_KEYCODE) return true;
+    if (keycode == KEY_4_KEYCODE) return true;
+    if (keycode == KEY_5_KEYCODE) return true;
+    if (keycode == KEY_6_KEYCODE) return true;
+    if (keycode == KEY_7_KEYCODE) return true;
+    if (keycode == KEY_8_KEYCODE) return true;
+    if (keycode == KEY_9_KEYCODE) return true;
+
+    return false;
 }
 
-// HID initialization
-static IOHIDManagerRef init_hid(void) {
-    IOHIDManagerRef manager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
-    if (!manager) return NULL;
+// CGEventTap callback - intercepts keyboard events globally
+static CGEventRef event_tap_callback(CGEventTapProxy proxy, CGEventType type, CGEventRef event, void *userInfo) {
+    // Handle tap being disabled (system can disable if it's too slow)
+    if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
+        CFMachPortRef eventTap = (CFMachPortRef)userInfo;
+        CGEventTapEnable(eventTap, true);
+        return event;
+    }
 
-    CFMutableDictionaryRef dict = CFDictionaryCreateMutable(kCFAllocatorDefault, 2,
-        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    // Only handle key events
+    if (type != kCGEventKeyDown && type != kCGEventKeyUp && type != kCGEventFlagsChanged) {
+        return event;
+    }
 
-    int page = kHIDPage_GenericDesktop;
-    int usage = kHIDUsage_GD_Keyboard;
-    CFNumberRef pageNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &page);
-    CFNumberRef usageNum = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &usage);
+    // Pass through if Cmd, Ctrl, or Option is held (allow system shortcuts like Cmd+Tab)
+    CGEventFlags flags = CGEventGetFlags(event);
+    if (flags & (kCGEventFlagMaskCommand | kCGEventFlagMaskControl | kCGEventFlagMaskAlternate)) {
+        return event;
+    }
 
-    CFDictionarySetValue(dict, CFSTR(kIOHIDDeviceUsagePageKey), pageNum);
-    CFDictionarySetValue(dict, CFSTR(kIOHIDDeviceUsageKey), usageNum);
-    IOHIDManagerSetDeviceMatching(manager, dict);
+    CGKeyCode keycode = (CGKeyCode)CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+    bool pressed = (type == kCGEventKeyDown);
+    bool isKeyUp = (type == kCGEventKeyUp);
 
-    CFRelease(pageNum);
-    CFRelease(usageNum);
-    CFRelease(dict);
+    // Handle flags changed (for Caps Lock)
+    if (type == kCGEventFlagsChanged) {
+        if (keycode == CAPSLOCK_KEYCODE) {
+            capsLockOn = (flags & kCGEventFlagMaskAlphaShift) != 0;
+            sync_recording_to_capslock();
+            return NULL;  // Consume caps lock
+        }
+        return event;
+    }
 
-    IOHIDManagerRegisterInputValueCallback(manager, hid_callback, NULL);
-    IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+    // Check if we should handle this key
+    if (!should_consume_key(keycode)) {
+        return event;  // Pass through to other apps
+    }
 
-    if (IOHIDManagerOpen(manager, kIOHIDOptionsTypeNone) != kIOReturnSuccess) {
-        CFRelease(manager);
+    // Ignore key repeat (only handle first press and release)
+    if (keycode < 128) {
+        if (pressed && keyIsHeld[keycode]) {
+            return NULL;  // Ignore repeated keyDown, but consume it
+        }
+        if (pressed) {
+            keyIsHeld[keycode] = true;
+        } else if (isKeyUp) {
+            keyIsHeld[keycode] = false;
+        }
+    }
+
+    // ESC - Quit
+    if (keycode == ESC_KEYCODE && pressed) {
+        printf("\n");
+        CFRunLoopStop(CFRunLoopGetCurrent());
         return NULL;
     }
 
-    return manager;
+    // SPACE - Toggle clock
+    if (keycode == SPACE_KEYCODE && pressed) {
+        toggle_clock();
+        return NULL;
+    }
+
+    // TAB - Toggle metronome
+    if (keycode == TAB_KEYCODE && pressed) {
+        toggle_metronome();
+        return NULL;
+    }
+
+    // Arrow keys
+    if (keycode == LEFT_ARROW_KEYCODE && pressed) {
+        octave_down();
+        return NULL;
+    }
+    if (keycode == RIGHT_ARROW_KEYCODE && pressed) {
+        octave_up();
+        return NULL;
+    }
+    if (keycode == UP_ARROW_KEYCODE) {
+        if (pressed) start_tempo_change_timer(1);
+        else if (isKeyUp) stop_tempo_change_timer();
+        return NULL;
+    }
+    if (keycode == DOWN_ARROW_KEYCODE) {
+        if (pressed) start_tempo_change_timer(-1);
+        else if (isKeyUp) stop_tempo_change_timer();
+        return NULL;
+    }
+
+    // MINUS - Channel down
+    if (keycode == MINUS_KEYCODE && pressed) {
+        channel_change((currentChannel - 1 + 16) % 16);
+        return NULL;
+    }
+
+    // EQUALS - Channel up
+    if (keycode == EQUALS_KEYCODE && pressed) {
+        channel_change((currentChannel + 1) % 16);
+        return NULL;
+    }
+
+    // Brackets - Program change
+    if (keycode == LBRACKET_KEYCODE) {
+        if (pressed) start_program_change_timer(-1);
+        else if (isKeyUp) stop_program_change_timer();
+        return NULL;
+    }
+    if (keycode == RBRACKET_KEYCODE) {
+        if (pressed) start_program_change_timer(1);
+        else if (isKeyUp) stop_program_change_timer();
+        return NULL;
+    }
+
+    // SLASH - Save
+    if (keycode == SLASH_KEYCODE && pressed) {
+        save_midi_file();
+        return NULL;
+    }
+
+    // DELETE - Clear current track
+    if (keycode == DELETE_KEYCODE && pressed) {
+        clear_current_track();
+        return NULL;
+    }
+
+    // BACKTICK - Toggle quantize
+    if (keycode == BACKTICK_KEYCODE && pressed) {
+        toggle_quantize();
+        return NULL;
+    }
+
+    // BACKSLASH - Panic (all notes off on all channels)
+    if (keycode == BACKSLASH_KEYCODE && pressed) {
+        midi_panic();
+        return NULL;
+    }
+
+    // Number keys 0-9 - Select MIDI output
+    if (keycode == KEY_0_KEYCODE && pressed) { select_midi_output(0); return NULL; }
+    if (keycode == KEY_1_KEYCODE && pressed) { select_midi_output(1); return NULL; }
+    if (keycode == KEY_2_KEYCODE && pressed) { select_midi_output(2); return NULL; }
+    if (keycode == KEY_3_KEYCODE && pressed) { select_midi_output(3); return NULL; }
+    if (keycode == KEY_4_KEYCODE && pressed) { select_midi_output(4); return NULL; }
+    if (keycode == KEY_5_KEYCODE && pressed) { select_midi_output(5); return NULL; }
+    if (keycode == KEY_6_KEYCODE && pressed) { select_midi_output(6); return NULL; }
+    if (keycode == KEY_7_KEYCODE && pressed) { select_midi_output(7); return NULL; }
+    if (keycode == KEY_8_KEYCODE && pressed) { select_midi_output(8); return NULL; }
+    if (keycode == KEY_9_KEYCODE && pressed) { select_midi_output(9); return NULL; }
+
+    // Note keys
+    int note = keycode_to_note(keycode);
+    if (note >= 0) {
+        if (pressed) note_on(note, 100);
+        else if (isKeyUp) note_off(note);
+        return NULL;
+    }
+
+    return event;
+}
+
+// Event tap initialization
+static CFMachPortRef eventTap = NULL;
+static CFRunLoopSourceRef runLoopSource = NULL;
+
+static bool init_event_tap(void) {
+    // Create event tap for key down, key up, and flags changed events
+    CGEventMask eventMask = (1 << kCGEventKeyDown) | (1 << kCGEventKeyUp) | (1 << kCGEventFlagsChanged);
+
+    eventTap = CGEventTapCreate(
+        kCGSessionEventTap,           // Tap at session level
+        kCGHeadInsertEventTap,        // Insert at head of event stream
+        kCGEventTapOptionDefault,     // Active tap (can modify/consume events)
+        eventMask,
+        event_tap_callback,
+        NULL
+    );
+
+    if (!eventTap) {
+        fprintf(stderr, "Failed to create event tap. Grant Accessibility permission in:\n");
+        fprintf(stderr, "  System Settings > Privacy & Security > Accessibility\n");
+        return false;
+    }
+
+    // Pass eventTap to callback for re-enabling if disabled
+    CGEventTapEnable(eventTap, true);
+
+    runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, eventTap, 0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+
+    return true;
 }
 
 // Main
@@ -1087,7 +1346,7 @@ int main(void) {
 
     init_timing();
     update_timing_constants();
-    disable_echo();2
+    disable_echo();
 
     printf("terminalMIDI - 16-Track MIDI Recorder (optimised)\n");
     printf("══════════════════════════════════════════════════\n");
@@ -1100,20 +1359,34 @@ int main(void) {
     printf("↑/↓        Tempo up/down (hold)\n");
     printf("-/=        Channel down/up\n");
     printf("[/]        Program down/up (hold)\n");
+    printf("0-9        Select MIDI output\n");
     printf("DELETE     Clear current track\n");
     printf("/          Save MIDI file\n");
+    printf("\\          Panic (all notes off)\n");
     printf("ESC        Quit\n");
     printf("══════════════════════════════════════════════════\n");
-    printf("Loop: %d bars x %d beats = %d beats total\n\n", TOTAL_BARS, BEATS_PER_BAR, TOTAL_BEATS);
+    printf("Loop: %d bars x %d beats = %d beats total\n", TOTAL_BARS, BEATS_PER_BAR, TOTAL_BEATS);
 
     if (!init_audio()) {
         fprintf(stderr, "Failed to initialize audio\n");
         return 1;
     }
 
-    IOHIDManagerRef manager = init_hid();
-    if (!manager) {
-        fprintf(stderr, "Failed to initialize HID\n");
+    // Initialize MIDI output
+    if (!init_midi_output()) {
+        fprintf(stderr, "Warning: Could not initialize MIDI output\n");
+    }
+
+    // Print available MIDI outputs
+    printf("\nMIDI Outputs:\n");
+    printf("  0: Internal Synth (default)\n");
+    for (int i = 0; i < midiDestCount; i++) {
+        printf("  %d: %s\n", i + 1, midiDestNames[i]);
+    }
+    printf("\n");
+
+    if (!init_event_tap()) {
+        fprintf(stderr, "Failed to initialize event tap\n");
         if (graph) {
             AUGraphStop(graph);
             DisposeAUGraph(graph);
@@ -1125,8 +1398,17 @@ int main(void) {
     CFRunLoopRun();
 
     // Cleanup
-    IOHIDManagerClose(manager, kIOHIDOptionsTypeNone);
-    CFRelease(manager);
+    if (runLoopSource) {
+        CFRunLoopRemoveSource(CFRunLoopGetCurrent(), runLoopSource, kCFRunLoopCommonModes);
+        CFRelease(runLoopSource);
+    }
+    if (eventTap) {
+        CFRelease(eventTap);
+    }
+
+    if (midiClient) {
+        MIDIClientDispose(midiClient);
+    }
 
     if (graph) {
         AUGraphStop(graph);
